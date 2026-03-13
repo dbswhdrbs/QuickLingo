@@ -44,7 +44,7 @@ log = logging.getLogger("quicklingo")
 # ─────────────────────────────────────────────
 
 APP_NAME = "QuickLingo"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.2.0"
 POPUP_MIN_W = 600
 POPUP_MIN_H = 280
 POPUP_DEFAULT_W = 720
@@ -300,10 +300,12 @@ def translate_deepl(text: str, cfg: dict) -> tuple:
     if cfg["source_lang"] != "auto":
         body["source_lang"] = cfg["source_lang"]
 
+    log.info(f"DeepL POST: {url}, target={cfg['target_lang']}, len={len(text)}")
     r = requests.post(url, headers={
         "Authorization": f"DeepL-Auth-Key {cfg['api_key']}",
         "Content-Type": "application/json",
     }, json=body, timeout=10)
+    log.info(f"DeepL response: status={r.status_code}")
 
     if r.status_code == 403:
         raise ValueError("Invalid DeepL API key.")
@@ -312,7 +314,10 @@ def translate_deepl(text: str, cfg: dict) -> tuple:
     r.raise_for_status()
 
     t = r.json()["translations"][0]
-    return t["text"], t.get("detected_source_language", "?")
+    result = t["text"]
+    detected = t.get("detected_source_language", "?")
+    log.info(f"DeepL result: {len(result)} chars, detected={detected}")
+    return result, detected
 
 
 def translate_google(text: str, cfg: dict) -> tuple:
@@ -339,6 +344,33 @@ def translate_text(text: str, cfg: dict) -> tuple:
     if engine == "google":
         return translate_google(text, cfg)
     return translate_deepl(text, cfg)
+
+
+def get_deepl_usage(cfg: dict) -> dict:
+    """
+    Query DeepL /v2/usage endpoint.
+    Returns {"character_count": int, "character_limit": int} or None on error.
+    """
+    if not cfg.get("api_key"):
+        return None
+    try:
+        base = "https://api.deepl.com" if cfg.get("api_type") == "pro" else "https://api-free.deepl.com"
+        r = requests.get(f"{base}/v2/usage", headers={
+            "Authorization": f"DeepL-Auth-Key {cfg['api_key']}",
+        }, timeout=5)
+        if r.status_code == 200:
+            data = r.json()
+            log.info(f"DeepL usage: {data.get('character_count')}/{data.get('character_limit')}")
+            return data
+    except Exception as e:
+        log.error(f"DeepL usage query error: {e}")
+    return None
+
+
+def format_usage(count: int, limit: int) -> str:
+    """Format usage numbers with comma separators."""
+    pct = (count / limit * 100) if limit > 0 else 0
+    return f"{count:,} / {limit:,}  ({pct:.1f}%)"
 
 
 # ─────────────────────────────────────────────
@@ -415,9 +447,17 @@ class TranslationPopup(ThemedMixin):
         self._status_label = None
         self._copy_btn = None
         self._translated_text = ""
+        self._usage_frame = None
+        self._usage_label = None
+        self._usage_pct_label = None
+        self._usage_canvas = None
+        self._theme = None
+        self._engine = None
 
     def show_loading(self, original: str, mouse_x: int, mouse_y: int, t: dict, engine: str):
         """Show popup immediately with original text and a loading indicator."""
+        self._theme = t  # Set theme FIRST before anything else
+        self._engine = engine
         self._close()
 
         win = tk.Toplevel(self.master)
@@ -497,6 +537,7 @@ class TranslationPopup(ThemedMixin):
         self._txt_orig.insert("1.0", original)
         self._txt_orig.config(state=tk.DISABLED)
         self._txt_orig.pack(fill=tk.BOTH, expand=True)
+        self._setup_context_menu(self._txt_orig, t, is_translation=False)
 
         # Separator
         sep = tk.Frame(panels, bg=t["bg"], width=8)
@@ -513,6 +554,35 @@ class TranslationPopup(ThemedMixin):
         self._txt_trans.insert("1.0", "Translating...")
         self._txt_trans.config(state=tk.DISABLED)
         self._txt_trans.pack(fill=tk.BOTH, expand=True)
+        self._setup_context_menu(self._txt_trans, t, is_translation=True)
+
+        # ── Resize grip (bottom-right corner indicator) ──
+        grip = tk.Label(win, text="\u25E2", bg=t["bg"], fg=t["fg_dim"],
+                        font=("Segoe UI", 8), cursor="bottom_right_corner", anchor="se")
+        grip.place(relx=1.0, rely=1.0, anchor="se")
+
+        # Setup edge/corner resize on the whole window
+        self._setup_resize(win)
+
+        # ── Usage bar (DeepL only, hidden initially) ──
+        self._usage_frame = tk.Frame(win, bg=t["bg"], padx=12)
+        # Don't pack yet — will be shown when usage data arrives
+
+        usage_inner = tk.Frame(self._usage_frame, bg=t["bg"])
+        usage_inner.pack(fill=tk.X)
+
+        self._usage_label = tk.Label(usage_inner, text="", bg=t["bg"],
+                                     fg=t["fg_dim"], font=("Segoe UI", 8), anchor="w")
+        self._usage_label.pack(side=tk.LEFT)
+
+        self._usage_pct_label = tk.Label(usage_inner, text="", bg=t["bg"],
+                                         fg=t["fg_dim"], font=("Segoe UI", 8), anchor="e")
+        self._usage_pct_label.pack(side=tk.RIGHT)
+
+        # Progress bar canvas
+        self._usage_canvas = tk.Canvas(self._usage_frame, height=6, bg=t["border"],
+                                       highlightthickness=0, bd=0)
+        self._usage_canvas.pack(fill=tk.X, pady=(3, 0))
 
         # ── Bottom bar ──
         bbar = tk.Frame(win, bg=t["bg"], padx=12, pady=8)
@@ -530,30 +600,32 @@ class TranslationPopup(ThemedMixin):
         win.bind("<Escape>", lambda e: self._close())
         win.after(50, win.focus_force)
 
-        # Store theme ref
-        self._theme = t
-
     def fill_translation(self, translated: str, src_lang: str, tgt_lang: str):
         """Called when translation is ready — fill in the result."""
+        log.info(f"fill_translation called: {len(translated)} chars, win exists={self.win and self.win.winfo_exists()}")
         if not self.win or not self.win.winfo_exists():
+            log.warning("fill_translation: window gone, skip")
             return
-        t = self._theme
-        self._translated_text = translated
+        if not self._theme:
+            log.error("fill_translation: _theme not set!")
+            return
+        try:
+            t = self._theme
+            self._translated_text = translated
 
-        # Update translation panel
-        self._txt_trans.config(state=tk.NORMAL)
-        self._txt_trans.delete("1.0", tk.END)
-        self._txt_trans.insert("1.0", translated)
-        self._txt_trans.config(state=tk.DISABLED, fg=t["fg"])
+            self._txt_trans.config(state=tk.NORMAL)
+            self._txt_trans.delete("1.0", tk.END)
+            self._txt_trans.insert("1.0", translated)
+            self._txt_trans.config(state=tk.DISABLED, fg=t["fg"])
 
-        # Update status
-        if self._status_label:
-            engine = "DeepL" if hasattr(self, '_engine') else ""
-            self._status_label.config(text=f"  {src_lang} \u2192 {tgt_lang}")
+            if self._status_label:
+                self._status_label.config(text=f"  {src_lang} \u2192 {tgt_lang}")
 
-        # Enable copy button
-        if self._copy_btn:
-            self._copy_btn.config(state=tk.NORMAL)
+            if self._copy_btn:
+                self._copy_btn.config(state=tk.NORMAL)
+            log.info("fill_translation: done")
+        except Exception as e:
+            log.error(f"fill_translation error: {e}\n{traceback.format_exc()}")
 
     def show_error(self, msg: str):
         if not self.win or not self.win.winfo_exists():
@@ -565,6 +637,51 @@ class TranslationPopup(ThemedMixin):
         self._txt_trans.config(state=tk.DISABLED, fg=t["error"])
         if self._status_label:
             self._status_label.config(text="  Translation failed", fg=t["error"])
+
+    def show_usage(self, usage_data: dict):
+        """Show DeepL usage bar at bottom of popup."""
+        if not self.win or not self.win.winfo_exists():
+            return
+        if not usage_data or not self._usage_frame or not self._theme:
+            return
+        try:
+            t = self._theme
+            count = usage_data.get("character_count", 0)
+            limit = usage_data.get("character_limit", 1)
+            pct = count / limit if limit > 0 else 0
+
+            # Show the usage frame
+            self._usage_frame.pack(fill=tk.X, pady=(4, 0))
+
+            self._usage_label.config(text=f"DeepL:  {count:,} / {limit:,}")
+
+            pct_text = f"{pct * 100:.1f}%"
+            if pct > 0.9:
+                self._usage_pct_label.config(text=pct_text, fg=t["error"])
+            elif pct > 0.7:
+                self._usage_pct_label.config(text=pct_text, fg="#ff9500")
+            else:
+                self._usage_pct_label.config(text=pct_text, fg=t["success"])
+
+            # Draw progress bar
+            self.win.update_idletasks()
+            w = self._usage_canvas.winfo_width()
+            if w < 10:
+                w = 400
+            h = 6
+            self._usage_canvas.delete("all")
+            self._usage_canvas.create_rectangle(0, 0, w, h, fill=t["border"], outline="")
+            fill_w = int(w * pct)
+            if pct > 0.9:
+                bar_color = t["error"]
+            elif pct > 0.7:
+                bar_color = "#ff9500"
+            else:
+                bar_color = t["accent"]
+            if fill_w > 0:
+                self._usage_canvas.create_rectangle(0, 0, fill_w, h, fill=bar_color, outline="")
+        except Exception as e:
+            log.error(f"show_usage error: {e}")
 
     def _copy(self):
         if self._translated_text and self.win:
@@ -588,6 +705,8 @@ class TranslationPopup(ThemedMixin):
             pass
         self.win = None
 
+    # ── Drag (title bar) ──
+
     def _drag_start(self, e):
         self._drag_data["x"] = e.x
         self._drag_data["y"] = e.y
@@ -599,6 +718,173 @@ class TranslationPopup(ThemedMixin):
             x = self.win.winfo_x() + dx
             y = self.win.winfo_y() + dy
             self.win.geometry(f"+{x}+{y}")
+
+    # ── Resize (edges & corners) ──
+
+    EDGE_SIZE = 8  # pixels from edge to detect resize
+
+    def _setup_resize(self, win):
+        """Bind resize events on the window AND all child widgets."""
+        self._resize_data = {"edge": None, "sx": 0, "sy": 0, "sw": 0, "sh": 0, "wx": 0, "wy": 0}
+        self._bind_resize_recursive(win)
+
+    def _bind_resize_recursive(self, widget):
+        """Recursively bind resize events to widget and all descendants."""
+        widget.bind("<Motion>", self._resize_cursor, add="+")
+        widget.bind("<Button-1>", self._resize_start, add="+")
+        widget.bind("<B1-Motion>", self._resize_move, add="+")
+        widget.bind("<ButtonRelease-1>", self._resize_end, add="+")
+        for child in widget.winfo_children():
+            self._bind_resize_recursive(child)
+
+    def _get_edge_from_root(self, e):
+        """Detect edge using screen-absolute coordinates (works regardless of which widget got the event)."""
+        if not self.win:
+            return None
+        # Convert to window-relative coordinates
+        win_x = self.win.winfo_rootx()
+        win_y = self.win.winfo_rooty()
+        win_w = self.win.winfo_width()
+        win_h = self.win.winfo_height()
+
+        x = e.x_root - win_x  # relative to window left
+        y = e.y_root - win_y  # relative to window top
+        sz = self.EDGE_SIZE
+
+        on_left = x < sz
+        on_right = x > win_w - sz
+        on_top = y < sz
+        on_bottom = y > win_h - sz
+
+        if on_bottom and on_right:
+            return "se"
+        if on_bottom and on_left:
+            return "sw"
+        if on_top and on_right:
+            return "ne"
+        if on_top and on_left:
+            return "nw"
+        if on_bottom:
+            return "s"
+        if on_right:
+            return "e"
+        if on_left:
+            return "w"
+        if on_top:
+            return "n"
+        return None
+
+    CURSOR_MAP = {
+        "n": "top_side", "s": "bottom_side", "e": "right_side", "w": "left_side",
+        "ne": "top_right_corner", "nw": "top_left_corner",
+        "se": "bottom_right_corner", "sw": "bottom_left_corner",
+    }
+
+    def _resize_cursor(self, e):
+        if not self.win:
+            return
+        edge = self._get_edge_from_root(e)
+        cursor = self.CURSOR_MAP.get(edge, "")
+        try:
+            e.widget.config(cursor=cursor)
+        except Exception:
+            pass
+
+    def _resize_start(self, e):
+        edge = self._get_edge_from_root(e)
+        if not edge or not self.win:
+            return
+        self._resize_data = {
+            "edge": edge,
+            "sx": e.x_root, "sy": e.y_root,
+            "sw": self.win.winfo_width(), "sh": self.win.winfo_height(),
+            "wx": self.win.winfo_x(), "wy": self.win.winfo_y(),
+        }
+
+    def _resize_move(self, e):
+        d = self._resize_data
+        edge = d.get("edge")
+        if not edge or not self.win:
+            return
+
+        dx = e.x_root - d["sx"]
+        dy = e.y_root - d["sy"]
+        x, y, w, h = d["wx"], d["wy"], d["sw"], d["sh"]
+
+        if "e" in edge:
+            w = max(POPUP_MIN_W, d["sw"] + dx)
+        if "s" in edge:
+            h = max(POPUP_MIN_H, d["sh"] + dy)
+        if "w" in edge:
+            nw = max(POPUP_MIN_W, d["sw"] - dx)
+            x = d["wx"] + (d["sw"] - nw)
+            w = nw
+        if "n" in edge:
+            nh = max(POPUP_MIN_H, d["sh"] - dy)
+            y = d["wy"] + (d["sh"] - nh)
+            h = nh
+
+        self.win.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _resize_end(self, e):
+        self._resize_data["edge"] = None
+
+    # ── Right-click context menu ──
+
+    def _setup_context_menu(self, text_widget, t, is_translation=False):
+        """Add right-click context menu to a Text widget."""
+        menu = tk.Menu(text_widget, tearoff=0,
+                       bg=t["card_bg"], fg=t["fg"],
+                       activebackground=t["accent"], activeforeground="#ffffff",
+                       font=("Segoe UI", 10), borderwidth=1, relief=tk.FLAT)
+
+        def copy_all():
+            text_widget.config(state=tk.NORMAL)
+            content = text_widget.get("1.0", tk.END).strip()
+            text_widget.config(state=tk.DISABLED)
+            if content and self.win:
+                self.win.clipboard_clear()
+                self.win.clipboard_append(content)
+
+        def copy_selection():
+            try:
+                text_widget.config(state=tk.NORMAL)
+                sel = text_widget.get(tk.SEL_FIRST, tk.SEL_LAST)
+                text_widget.config(state=tk.DISABLED)
+                if sel and self.win:
+                    self.win.clipboard_clear()
+                    self.win.clipboard_append(sel)
+            except tk.TclError:
+                pass  # no selection
+
+        def select_all():
+            text_widget.config(state=tk.NORMAL)
+            text_widget.tag_add(tk.SEL, "1.0", tk.END)
+            text_widget.config(state=tk.DISABLED)
+
+        menu.add_command(label="Copy All", command=copy_all)
+        menu.add_command(label="Copy Selection", command=copy_selection)
+        menu.add_separator()
+        menu.add_command(label="Select All", command=select_all)
+
+        def show_menu(event):
+            # Enable text selection by temporarily making it normal
+            text_widget.config(state=tk.NORMAL, cursor="xterm")
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                text_widget.config(state=tk.DISABLED)
+
+        text_widget.bind("<Button-3>", show_menu)
+
+        # Allow mouse selection in disabled text widget
+        def enable_select(event):
+            text_widget.config(state=tk.NORMAL, cursor="xterm")
+        def disable_select(event):
+            text_widget.config(state=tk.DISABLED, cursor="arrow")
+
+        text_widget.bind("<Button-1>", enable_select, add="+")
+        text_widget.bind("<ButtonRelease-1>", lambda e: text_widget.after(50, lambda: disable_select(e)), add="+")
 
 
 # ─────────────────────────────────────────────
@@ -687,6 +973,75 @@ class SettingsWindow(ThemedMixin):
                            bg=t["card_bg"], fg=t["fg"], selectcolor=t["input_bg"],
                            activebackground=t["card_bg"], activeforeground=t["fg"],
                            font=("Segoe UI", 9), cursor="hand2").pack(side=tk.LEFT, padx=(0, 12))
+
+        # ── DeepL Usage Display ──
+        usage_frame = tk.Frame(deepl_frame, bg=t["card_bg"])
+        usage_frame.pack(fill=tk.X, pady=(8, 0))
+
+        usage_sep = tk.Frame(usage_frame, bg=t["separator"], height=1)
+        usage_sep.pack(fill=tk.X, pady=(0, 8))
+
+        usage_row = tk.Frame(usage_frame, bg=t["card_bg"])
+        usage_row.pack(fill=tk.X)
+
+        usage_info_label = tk.Label(usage_row, text="API Usage:  Click 'Check' to load",
+                                    bg=t["card_bg"], fg=t["fg_dim"],
+                                    font=("Segoe UI", 9), anchor="w")
+        usage_info_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        usage_bar_canvas = tk.Canvas(usage_frame, height=8, bg=t["border"],
+                                     highlightthickness=0, bd=0)
+
+        def check_usage():
+            key = api_var.get().strip()
+            atype = api_type_var.get()
+            if not key:
+                usage_info_label.config(text="API Usage:  Enter API key first", fg=t["error"])
+                return
+            usage_info_label.config(text="API Usage:  Checking...", fg=t["fg_dim"])
+            check_btn.config(state=tk.DISABLED)
+            win.update_idletasks()
+
+            def do_check():
+                tmp_cfg = {"api_key": key, "api_type": atype}
+                data = get_deepl_usage(tmp_cfg)
+                def update_ui():
+                    check_btn.config(state=tk.NORMAL)
+                    if data:
+                        count = data.get("character_count", 0)
+                        limit = data.get("character_limit", 1)
+                        pct = count / limit if limit > 0 else 0
+                        usage_info_label.config(
+                            text=f"API Usage:  {count:,} / {limit:,}  ({pct * 100:.1f}%)",
+                            fg=t["fg"])
+                        # Show and draw bar
+                        usage_bar_canvas.pack(fill=tk.X, pady=(4, 0))
+                        win.update_idletasks()
+                        w = usage_bar_canvas.winfo_width()
+                        if w < 10:
+                            w = 300
+                        usage_bar_canvas.delete("all")
+                        usage_bar_canvas.create_rectangle(0, 0, w, 8, fill=t["border"], outline="")
+                        fill_w = int(w * pct)
+                        if pct > 0.9:
+                            bar_c = t["error"]
+                        elif pct > 0.7:
+                            bar_c = "#ff9500"
+                        else:
+                            bar_c = t["accent"]
+                        if fill_w > 0:
+                            usage_bar_canvas.create_rectangle(0, 0, fill_w, 8, fill=bar_c, outline="")
+                        # Resize window
+                        win.update_idletasks()
+                        win.geometry("")
+                    else:
+                        usage_info_label.config(text="API Usage:  Failed to fetch (check key)", fg=t["error"])
+                win.after(0, update_ui)
+
+            threading.Thread(target=do_check, daemon=True).start()
+
+        check_btn = self.make_button(usage_row, "Check", t, check_usage, primary=False)
+        check_btn.pack(side=tk.RIGHT)
 
         def toggle_engine(*_args):
             if engine_var.get() == "deepl":
@@ -958,15 +1313,19 @@ class App:
 
     def _on_hotkey(self):
         try:
+            log.info("=== Hotkey triggered ===")
             mouse = get_mouse_pos()
+            log.info(f"Mouse pos: {mouse}")
+
             preset = HOTKEY_PRESETS.get(self.cfg.get("hotkey", "Ctrl+C, C"), {})
             if not preset.get("copies", True):
                 simulate_copy()
             time.sleep(0.08)
 
             text = self._get_clipboard()
+            log.info(f"Clipboard: {len(text)} chars, first 50: {text[:50]!r}")
             if not text:
-                log.info("Empty clipboard")
+                log.info("Empty clipboard, skip")
                 return
 
             engine = self.cfg.get("engine", "deepl")
@@ -980,16 +1339,41 @@ class App:
             # Show popup immediately with loading state
             self.root.after(0, lambda: self.popup.show_loading(text, mouse[0], mouse[1], t, engine))
 
-            # Translate
-            translated, detected = translate_text(text, self.cfg)
+            # Small delay to let popup render before we block on API
+            time.sleep(0.05)
+
+            # Translate — capture all variables for lambda
+            log.info(f"Calling translate_text via {engine}...")
+            try:
+                translated, detected = translate_text(text, self.cfg)
+                log.info(f"Translation OK: {len(translated)} chars, detected={detected}")
+            except Exception as te:
+                log.error(f"translate_text FAILED: {te}\n{traceback.format_exc()}")
+                err = str(te)
+                self.root.after(0, lambda e=err: self.popup.show_error(e))
+                return
+
             src = detected if self.cfg["source_lang"] == "auto" else self.cfg["source_lang"]
             tgt = self.cfg["target_lang"]
-            self.root.after(0, lambda: self.popup.fill_translation(translated, src, tgt))
+
+            # Use default arg to capture values (avoid late-binding lambda issues)
+            self.root.after(0, lambda tr=translated, s=src, tg=tgt: self.popup.fill_translation(tr, s, tg))
+            log.info("fill_translation scheduled")
+
+            # Fetch DeepL usage after translation
+            if engine == "deepl":
+                try:
+                    usage = get_deepl_usage(self.cfg)
+                    if usage:
+                        self.root.after(0, lambda u=usage: self.popup.show_usage(u))
+                        log.info(f"Usage: {usage.get('character_count')}/{usage.get('character_limit')}")
+                except Exception as ue:
+                    log.error(f"Usage fetch error: {ue}")
 
         except Exception as e:
             log.error(f"hotkey err: {e}\n{traceback.format_exc()}")
-            msg = str(e)
-            self.root.after(0, lambda: self.popup.show_error(msg))
+            err = str(e)
+            self.root.after(0, lambda msg=err: self.popup.show_error(msg))
 
     def _open_settings(self):
         def on_save(cfg):
