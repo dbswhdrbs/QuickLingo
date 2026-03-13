@@ -2,8 +2,9 @@
 
 Select text anywhere, press your hotkey, and get an instant translation popup.
 Supports **DeepL** and **Google Translate**.
-
----
+<p align="center">
+<img width="562" height="756" alt="image" src="https://github.com/user-attachments/assets/e46957ff-8124-4870-90f8-150c92678200" />
+</p>
 
 ## Features
 
