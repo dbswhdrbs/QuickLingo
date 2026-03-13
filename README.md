@@ -5,6 +5,10 @@
 A lightweight Windows system tray translation tool that supports **DeepL** and **Google Translate**.  
 No browser needed — just a hotkey and a popup right next to your cursor.
 
+<p align="center">
+<img width="562" height="809" alt="image" src="https://github.com/user-attachments/assets/18577b1d-3a1a-4cae-9c8a-fd24989ae23b" />
+</p>
+
 ---
 
 ## Features
