@@ -1,6 +1,6 @@
 @echo off
 echo ============================================
-echo   QuickLingo v2.0 - Build
+echo   QuickLingo v2.3 - Build
 echo ============================================
 echo.
 
@@ -25,7 +25,7 @@ if errorlevel 1 (
 REM Build EXE
 echo.
 echo [2/3] Building EXE... (takes 1-2 min)
-python -m PyInstaller --onefile --noconsole --name "QuickLingo" translator.py
+python -m PyInstaller --onefile --noconsole --collect-data certifi --name "QuickLingo" translator.py
 if errorlevel 1 (
     echo [ERROR] Build failed.
     pause

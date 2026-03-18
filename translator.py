@@ -1,8 +1,8 @@
 """
-QuickLingo v2.0
+QuickLingo v2.3
 ===============
 Windows tray-resident translation tool.
-Supports DeepL and Google Translate.
+Supports DeepL, Google Translate, and Gemini AI.
 Configurable hotkey, dark/light/system theme.
 """
 
@@ -40,11 +40,50 @@ logging.basicConfig(
 log = logging.getLogger("quicklingo")
 
 # ─────────────────────────────────────────────
+# SSL Certificate Fix (PyInstaller temp cleanup)
+# ─────────────────────────────────────────────
+
+def _fix_ssl_certs():
+    """
+    PyInstaller --onefile extracts to Temp\\_MEIxxxxxx.
+    If a cleanup tool deletes that folder's certifi/cacert.pem,
+    all HTTPS requests fail. Fix: copy certs to AppData on first
+    successful run, then fall back to the AppData copy.
+    """
+    if not getattr(sys, "frozen", False):
+        return  # Running from source, no fix needed
+
+    app_cert = LOG_DIR / "cacert.pem"
+
+    # Try to use the bundled certifi cert
+    try:
+        import certifi
+        bundled = certifi.where()
+        if os.path.exists(bundled):
+            # Cert exists — copy to AppData as backup for next time
+            import shutil
+            LOG_DIR.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(bundled, str(app_cert))
+            return  # All good
+    except Exception:
+        pass
+
+    # Bundled cert is missing (temp was cleaned) — use the backup
+    if app_cert.exists():
+        os.environ["REQUESTS_CA_BUNDLE"] = str(app_cert)
+        os.environ["SSL_CERT_FILE"] = str(app_cert)
+        log.info(f"SSL fix: using backup cert at {app_cert}")
+    else:
+        log.warning("SSL fix: no backup cert found, HTTPS may fail")
+
+_fix_ssl_certs()
+
+# ─────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────
 
 APP_NAME = "QuickLingo"
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.3.0"
 POPUP_MIN_W = 600
 POPUP_MIN_H = 280
 POPUP_DEFAULT_W = 720
@@ -206,8 +245,10 @@ HOTKEY_PRESETS = {
 DEFAULT_CONFIG = {
     "api_key": "",
     "api_type": "free",
-    "engine": "deepl",          # "deepl" or "google"
+    "engine": "deepl",          # "deepl", "google", or "gemini"
     "google_api_key": "",       # empty = use free endpoint
+    "gemini_api_key": "",
+    "gemini_model": "gemini-2.5-flash",
     "source_lang": "auto",
     "target_lang": "KO",
     "autostart": True,
@@ -338,11 +379,84 @@ def translate_google(text: str, cfg: dict) -> tuple:
     return translated, detected.upper()
 
 
+# Language name map for Gemini prompts
+LANG_NAMES = {
+    "auto": "auto-detect", "BG": "Bulgarian", "CS": "Czech", "DA": "Danish",
+    "DE": "German", "EL": "Greek", "EN": "English", "EN-US": "English",
+    "EN-GB": "English", "ES": "Spanish", "ET": "Estonian", "FI": "Finnish",
+    "FR": "French", "HU": "Hungarian", "ID": "Indonesian", "IT": "Italian",
+    "JA": "Japanese", "KO": "Korean", "LT": "Lithuanian", "LV": "Latvian",
+    "NB": "Norwegian", "NL": "Dutch", "PL": "Polish", "PT-BR": "Portuguese",
+    "PT-PT": "Portuguese", "RO": "Romanian", "RU": "Russian", "SK": "Slovak",
+    "SL": "Slovenian", "SV": "Swedish", "TR": "Turkish", "UK": "Ukrainian",
+    "ZH": "Chinese", "ZH-HANS": "Simplified Chinese", "ZH-HANT": "Traditional Chinese",
+    "AR": "Arabic", "HI": "Hindi", "TH": "Thai", "VI": "Vietnamese",
+}
+
+
+def translate_gemini(text: str, cfg: dict) -> tuple:
+    """Translate using Google Gemini API via REST (no SDK needed)."""
+    api_key = cfg.get("gemini_api_key", "")
+    if not api_key:
+        raise ValueError("Gemini API key is not set.")
+
+    model = cfg.get("gemini_model", "gemini-2.5-flash")
+    tgt_name = LANG_NAMES.get(cfg["target_lang"], cfg["target_lang"])
+
+    if cfg["source_lang"] == "auto":
+        src_instruction = "Detect the source language automatically."
+    else:
+        src_name = LANG_NAMES.get(cfg["source_lang"], cfg["source_lang"])
+        src_instruction = f"The source language is {src_name}."
+
+    prompt = (
+        f"You are a professional translator. Translate the following text into {tgt_name}. "
+        f"{src_instruction} "
+        "Return ONLY the translated text, nothing else. No explanations, no quotes, no markdown.\n\n"
+        f"{text}"
+    )
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+
+    log.info(f"Gemini POST: model={model}, target={tgt_name}, len={len(text)}")
+    r = requests.post(url, json={
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.1,
+            "maxOutputTokens": 4096,
+        },
+    }, timeout=15)
+    log.info(f"Gemini response: status={r.status_code}")
+
+    if r.status_code == 400:
+        err = r.json().get("error", {}).get("message", "Bad request")
+        raise ValueError(f"Gemini error: {err}")
+    if r.status_code == 403:
+        raise ValueError("Invalid Gemini API key.")
+    if r.status_code == 429:
+        raise ValueError("Gemini rate limit exceeded. Try again later.")
+    r.raise_for_status()
+
+    data = r.json()
+    try:
+        translated = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    except (KeyError, IndexError) as e:
+        log.error(f"Gemini unexpected response: {data}")
+        raise ValueError(f"Gemini returned unexpected format: {e}")
+
+    # Try to detect source language from context (Gemini doesn't return it explicitly)
+    detected = "?" if cfg["source_lang"] == "auto" else cfg["source_lang"]
+    log.info(f"Gemini result: {len(translated)} chars")
+    return translated, detected
+
+
 def translate_text(text: str, cfg: dict) -> tuple:
     engine = cfg.get("engine", "deepl")
     log.info(f"Translating via {engine}: {len(text)} chars -> {cfg['target_lang']}")
     if engine == "google":
         return translate_google(text, cfg)
+    if engine == "gemini":
+        return translate_gemini(text, cfg)
     return translate_deepl(text, cfg)
 
 
@@ -939,12 +1053,12 @@ class SettingsWindow(ThemedMixin):
         eng_frame = tk.Frame(sec, bg=t["card_bg"])
         eng_frame.pack(fill=tk.X, pady=(0, 8))
 
-        for val, label in [("deepl", "DeepL"), ("google", "Google Translate (Free)")]:
+        for val, label in [("deepl", "DeepL"), ("google", "Google Translate (Free)"), ("gemini", "Gemini AI")]:
             rb = tk.Radiobutton(eng_frame, text=label, variable=engine_var, value=val,
                                 bg=t["card_bg"], fg=t["fg"], selectcolor=t["input_bg"],
                                 activebackground=t["card_bg"], activeforeground=t["fg"],
                                 font=("Segoe UI", 10), cursor="hand2")
-            rb.pack(side=tk.LEFT, padx=(0, 20))
+            rb.pack(side=tk.LEFT, padx=(0, 16))
 
         # DeepL API config (show/hide based on engine)
         deepl_frame = tk.Frame(sec, bg=t["card_bg"])
@@ -1043,11 +1157,46 @@ class SettingsWindow(ThemedMixin):
         check_btn = self.make_button(usage_row, "Check", t, check_usage, primary=False)
         check_btn.pack(side=tk.RIGHT)
 
+        # ── Gemini config (show/hide based on engine) ──
+        gemini_frame = tk.Frame(sec, bg=t["card_bg"])
+
+        tk.Label(gemini_frame, text="Gemini API Key", bg=t["card_bg"], fg=t["fg_secondary"],
+                 font=("Segoe UI", 9)).pack(anchor="w", pady=(0, 2))
+        gemini_key_var = tk.StringVar(value=self.cfg.get("gemini_api_key", ""))
+        gemini_entry = self.make_entry(gemini_frame, t, var=gemini_key_var, show="\u2022", width=50)
+        gemini_entry.pack(fill=tk.X, pady=(0, 6))
+
+        gemini_show_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(gemini_frame, text="Show key", variable=gemini_show_var,
+                       bg=t["card_bg"], fg=t["fg_secondary"],
+                       selectcolor=t["input_bg"], activebackground=t["card_bg"],
+                       font=("Segoe UI", 9), cursor="hand2",
+                       command=lambda: gemini_entry.config(show="" if gemini_show_var.get() else "\u2022")
+                       ).pack(anchor="w", pady=(0, 6))
+
+        gmf = tk.Frame(gemini_frame, bg=t["card_bg"])
+        gmf.pack(fill=tk.X, pady=(0, 4))
+        tk.Label(gmf, text="Model:", bg=t["card_bg"], fg=t["fg_secondary"],
+                 font=("Segoe UI", 9)).pack(side=tk.LEFT, padx=(0, 8))
+        gemini_model_var = tk.StringVar(value=self.cfg.get("gemini_model", "gemini-2.5-flash"))
+        gemini_models = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro"]
+        gm_combo = ttk.Combobox(gmf, textvariable=gemini_model_var, values=gemini_models,
+                                state="readonly", width=24)
+        gm_combo.pack(side=tk.LEFT)
+
+        gemini_note = tk.Label(gemini_frame, bg=t["card_bg"], fg=t["fg_dim"],
+                               font=("Segoe UI", 8), anchor="w",
+                               text="Free: no credit card needed. Get key at aistudio.google.com")
+        gemini_note.pack(fill=tk.X, pady=(4, 0))
+
         def toggle_engine(*_args):
-            if engine_var.get() == "deepl":
+            deepl_frame.pack_forget()
+            gemini_frame.pack_forget()
+            eng = engine_var.get()
+            if eng == "deepl":
                 deepl_frame.pack(fill=tk.X, pady=(4, 0))
-            else:
-                deepl_frame.pack_forget()
+            elif eng == "gemini":
+                gemini_frame.pack(fill=tk.X, pady=(4, 0))
             # Resize window
             win.update_idletasks()
             win.geometry("")
@@ -1150,6 +1299,8 @@ class SettingsWindow(ThemedMixin):
             self.cfg["engine"] = engine_var.get()
             self.cfg["api_key"] = api_var.get().strip()
             self.cfg["api_type"] = api_type_var.get()
+            self.cfg["gemini_api_key"] = gemini_key_var.get().strip()
+            self.cfg["gemini_model"] = gemini_model_var.get()
             self.cfg["source_lang"] = src_codes[src_combo.current()]
             self.cfg["target_lang"] = tgt_codes[tgt_combo.current()]
             self.cfg["hotkey"] = hk_names[hk_combo.current()]
@@ -1333,6 +1484,10 @@ class App:
                 self.root.after(0, lambda: messagebox.showwarning(
                     APP_NAME, "DeepL API key not set.\nRight-click tray > Settings."))
                 return
+            if engine == "gemini" and not self.cfg.get("gemini_api_key"):
+                self.root.after(0, lambda: messagebox.showwarning(
+                    APP_NAME, "Gemini API key not set.\nRight-click tray > Settings."))
+                return
 
             t = get_theme(self.cfg.get("theme", "system"))
 
@@ -1423,7 +1578,11 @@ class App:
         self.tray = pystray.Icon(APP_NAME, make_icon(), APP_NAME, menu)
         threading.Thread(target=self.tray.run, daemon=True).start()
 
-        if not self.cfg.get("api_key") and self.cfg.get("engine") == "deepl":
+        needs_setup = (
+            (self.cfg.get("engine") == "deepl" and not self.cfg.get("api_key")) or
+            (self.cfg.get("engine") == "gemini" and not self.cfg.get("gemini_api_key"))
+        )
+        if needs_setup:
             self.root.after(500, self._open_settings)
 
         self.root.mainloop()
